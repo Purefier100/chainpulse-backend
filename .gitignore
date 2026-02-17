@@ -39,3 +39,8 @@ yarn-error.log*
 sniper_wallets.txt
 private_keys.txt
 keys.txt
+
+node_modules
+.env
+.pm2
+logs
