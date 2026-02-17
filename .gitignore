@@ -1,0 +1,41 @@
+# Environment variables (contains private keys!)
+.env
+.env.local
+.env.production
+
+# Node modules
+node_modules/
+package-lock.json
+
+# PM2 files
+.pm2/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE files
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*~
+
+# Build files
+dist/
+build/
+
+# Debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Private data
+sniper_wallets.txt
+private_keys.txt
+keys.txt

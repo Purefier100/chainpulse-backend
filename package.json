@@ -1,0 +1,25 @@
+{
+    "type": "module",
+    "dependencies": {
+        "@solana/spl-token": "^0.4.14",
+        "@solana/web3.js": "^1.98.4",
+        "axios": "^1.13.4",
+        "bs58": "^6.0.0",
+        "cors": "^2.8.6",
+        "dotenv": "^16.6.1",
+        "ethers": "^6.16.0",
+        "express": "^5.2.1",
+        "object-inspect": "^1.13.4",
+        "ws": "^8.19.0"
+    },
+    "name": "backend",
+    "version": "1.0.0",
+    "main": "index.js",
+    "scripts": {
+        "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "description": ""
+}
