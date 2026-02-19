@@ -6,16 +6,7 @@ import { getTopInsiders } from "./sniper/insiderTracker.js";
 
 import { queueAlert } from "./utils/alertQueue.js";
 
-/**
- * ========================================
- * 🚀 CHAINPULSE ALPHA ENGINE
- * ========================================
- * Multi-chain whale detector with advanced security
- */
 
-/**
- * Prevent double-start (PM2 restart protection)
- */
 if (globalThis.__CHAINPULSE_STARTED__) {
     console.log("⚠️  ChainPulse already running, skipping duplicate start...");
     process.exit(0);
@@ -26,9 +17,7 @@ globalThis.__CHAINPULSE_STARTED__ = true;
 console.log("🚀 ChainPulse Alpha Engine LIVE");
 console.log("━".repeat(50));
 
-/**
- * Start Base detector with error handling
- */
+
 try {
     watchBase();
     console.log("✅ Base detector initialized");
@@ -37,9 +26,6 @@ try {
     queueAlert("⚠️ Base detector startup failed: " + err.message);
 }
 
-/**
- * Start Solana detector with error handling
- */
 try {
     watchSolanaMomentum();
     console.log("✅ Solana detector initialized");
@@ -54,9 +40,7 @@ console.log("📡 Monitoring: Base Chain + Solana");
 console.log("🔬 Security: MAXIMUM (Honeypot + RugCheck + Full Analysis)");
 console.log("━".repeat(50));
 
-/**
- * Send startup confirmation
- */
+
 setTimeout(() => {
     queueAlert(
         "🚀 ChainPulse Alpha Engine Started\n\n" +
@@ -71,11 +55,9 @@ setTimeout(() => {
         "• Social Sentiment\n\n" +
         "🎯 Ready to catch premium opportunities!"
     );
-}, 5000); // Wait 5 seconds after startup
+}, 5000);
 
-/**
- * 🔥 Trending Meme Leaderboard (Hourly)
- */
+
 setInterval(() => {
     try {
         const trending = getTrendingTokens(5);
@@ -114,9 +96,7 @@ setInterval(() => {
     }
 }, 60 * 60 * 1000); // Every hour
 
-/**
- * Health check (every 30 minutes)
- */
+
 setInterval(() => {
     const uptime = process.uptime();
     const hours = Math.floor(uptime / 3600);
@@ -129,9 +109,7 @@ setInterval(() => {
     console.log("━".repeat(50));
 }, 30 * 60 * 1000); // Every 30 minutes
 
-/**
- * Graceful shutdown
- */
+
 process.on("SIGINT", () => {
     console.log("\n🛑 Shutting down ChainPulse...");
     queueAlert("🛑 ChainPulse shutting down gracefully");
@@ -151,9 +129,7 @@ process.on("SIGTERM", () => {
     }, 3000);
 });
 
-/**
- * Unhandled errors
- */
+
 process.on("unhandledRejection", (reason, promise) => {
     console.error("❌ Unhandled Rejection:", reason);
     // Don't crash - log and continue
@@ -163,7 +139,7 @@ process.on("uncaughtException", (error) => {
     console.error("❌ Uncaught Exception:", error);
     queueAlert(`⚠️ Critical Error: ${error.message}`);
 
-    // Give time for alert to send, then exit
+
     setTimeout(() => {
         process.exit(1);
     }, 5000);
