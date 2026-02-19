@@ -6,7 +6,6 @@ export const CONFIG = {
     BASE_WSS: process.env.BASE_WSS,
 
     SOLANA_RPC: process.env.SOLANA_RPC,
-    //SOLANA_WSS: process.env.SOLANA_WSS, // ✅ ADD THIS
 
     TG_TOKEN: process.env.TG_BOT_TOKEN,
     TG_CHAT_ID: process.env.TG_CHAT_ID,
