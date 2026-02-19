@@ -1,24 +1,13 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import axios from "axios";
-
 import { CONFIG } from "../config.js";
 import { queueAlert } from "../utils/alertQueue.js";
-import { recordWhale } from "../utils/whaleCluster.js";
-import { scoreToken } from "../utils/alphaScorer.js";
-
-// Import all advanced analysis modules
-import { analyzeHolderDistribution, isSafeDistribution } from "../utils/holderAnalyzer.js";
-import { analyzeCreatorHistory, isTrustedCreator } from "../utils/creatorAnalyzer.js";
-import { trackPriceMomentum, isPumpingNow } from "../utils/momentumTracker.js";
-import { getSocialSentiment, hasGoodSocials } from "../utils/socialSentiment.js";
-import { verifyLPLock, isLPSafe } from "../utils/lpLockVerifier.js";
-import { checkRugRisk, isSafeToTrade, getRiskEmoji } from "../utils/rugcheckIntegration.js";
 
 /**
  * ========================================
- * 🚀 ULTIMATE MULTI-DEX DETECTOR
+ * 🐸 SOLANA MEME COIN DETECTOR
  * ========================================
- * With ALL advanced security features
+ * Optimized for early meme detection
  */
 
 const connection = new Connection(CONFIG.SOLANA_RPC, "confirmed");
@@ -26,121 +15,151 @@ const connection = new Connection(CONFIG.SOLANA_RPC, "confirmed");
 const PROGRAMS = {
     PUMPFUN: new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
     RAYDIUM_V4: new PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"),
-    JUPITER_V6: new PublicKey("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"),
+    RAYDIUM_CPMM: new PublicKey("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"),
 };
 
-// Filters
-const MIN_BUY_USD = 300;
-const MIN_SCORE = 60; // Lower threshold since we have more filters
-const MIN_WHALES = 2;
-const MAX_AGE_MS = 60000;
+// ✅ Meme-friendly thresholds
+const MIN_BUY_USD = 200;           // Catch $200+ buys
+const MIN_WHALES = 2;              // 2 unique whales in window
+const BIG_SINGLE_BUY_USD = 2000;  // OR one massive buy
+const WINDOW_MS = 5 * 60 * 1000;  // 5 min accumulation window
+const MAX_AGE_MS = 30000;         // Only last 30s txns (fresh)
 
-// Advanced filtering
-const MIN_SAFETY_SCORE = 60; // Minimum combined safety score
-const REQUIRE_RUGCHECK = true; // Set to false to disable RugCheck requirement
+// Market cap filters — meme sweet spot
+const MIN_MCAP = 10000;
+const MAX_MCAP = 10000000; // Skip anything over $10M (already mooned)
+const MIN_LIQ = 3000;
+const MAX_LIQ = 300000;
 
-// Rate limiting
-let lastRpcCall = 0;
-const RPC_DELAY = 1000;
-
-async function rateLimitedCall(fn) {
-    const now = Date.now();
-    const timeSinceLastCall = now - lastRpcCall;
-    if (timeSinceLastCall < RPC_DELAY) {
-        await new Promise((r) => setTimeout(r, RPC_DELAY - timeSinceLastCall));
-    }
-    lastRpcCall = Date.now();
-    return await fn();
-}
-
-// Cache
-const alerted = new Set();
-const seenTx = new Set();
-const tokenData = new Map();
-
-// SOL Price
+// SOL price cache
 let solPrice = 140;
 let lastSolUpdate = 0;
 
+// State
+const alerted = new Set();
+const seenTx = new Set();
+const whaleBuyers = new Map(); // mint -> { buyers: Map, firstSeen, totalVolume }
+const tokenMetaCache = new Map();
+
+let totalScanned = 0;
+let totalAlerts = 0;
+
+// ========================================
+// 💰 SOL PRICE
+// ========================================
 async function getSolPrice() {
-    if (Date.now() - lastSolUpdate < 300000 && solPrice > 0) {
-        return solPrice;
-    }
+    if (Date.now() - lastSolUpdate < 60000 && solPrice > 0) return solPrice;
     try {
         const res = await axios.get(
             "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
-            { timeout: 5000 }
+            { timeout: 4000 }
         );
         solPrice = res.data.solana.usd;
         lastSolUpdate = Date.now();
-        console.log(`💰 SOL Price: $${solPrice}`);
-    } catch (err) {
+        console.log(`💰 SOL: $${solPrice}`);
+    } catch {
         console.log("⚠️  Using cached SOL price");
     }
     return solPrice;
 }
 
-async function getTokenMetadata(mint) {
-    if (tokenData.has(mint)) return tokenData.get(mint);
-    try {
-        const response = await rateLimitedCall(() =>
-            axios.post(
-                CONFIG.SOLANA_RPC,
-                {
-                    jsonrpc: "2.0",
-                    id: "meta",
-                    method: "getAsset",
-                    params: { id: mint },
-                },
-                { timeout: 5000 }
-            )
-        );
-        const metadata = {
-            name: response.data?.result?.content?.metadata?.name || "Unknown",
-            symbol: response.data?.result?.content?.metadata?.symbol || "???",
-        };
-        tokenData.set(mint, metadata);
-        return metadata;
-    } catch (err) {
-        return { name: "Unknown", symbol: "???" };
-    }
-}
+// ========================================
+// 🔍 TOKEN METADATA (DexScreener first, RPC fallback)
+// ========================================
+async function getTokenInfo(mint) {
+    if (tokenMetaCache.has(mint)) return tokenMetaCache.get(mint);
 
-async function getTokenLiquidity(mint) {
     try {
-        const response = await axios.get(
+        const res = await axios.get(
             `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
-            { timeout: 5000 }
+            { timeout: 4000 }
         );
-        const pairs = response.data?.pairs || [];
-        if (pairs.length === 0) return 0;
-        return pairs.reduce((sum, pair) => sum + (parseFloat(pair.liquidity?.usd) || 0), 0);
-    } catch (err) {
-        return 0;
+
+        const pairs = res.data?.pairs || [];
+        const solanaPair = pairs
+            .filter((p) => p.chainId === "solana")
+            .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+
+        if (!solanaPair) return null;
+
+        const ageHours = solanaPair.pairCreatedAt
+            ? (Date.now() - solanaPair.pairCreatedAt) / (1000 * 60 * 60)
+            : null;
+
+        const info = {
+            name: solanaPair.baseToken?.name || "Unknown",
+            symbol: solanaPair.baseToken?.symbol || "???",
+            liquidity: solanaPair.liquidity?.usd || 0,
+            marketCap: solanaPair.fdv || 0,
+            priceUsd: solanaPair.priceUsd || 0,
+            pairAddress: solanaPair.pairAddress,
+            ageHours,
+            priceChange5m: solanaPair.priceChange?.m5 || 0,
+            priceChange1h: solanaPair.priceChange?.h1 || 0,
+            volume5m: solanaPair.volume?.m5 || 0,
+            buys5m: solanaPair.txns?.m5?.buys || 0,
+            sells5m: solanaPair.txns?.m5?.sells || 0,
+        };
+
+        tokenMetaCache.set(mint, info);
+        // Cache for only 2 min (meme prices move fast)
+        setTimeout(() => tokenMetaCache.delete(mint), 120000);
+        return info;
+    } catch {
+        return null;
     }
 }
 
-async function parseSwapTransaction(signature, programId) {
+// ========================================
+// 🍯 QUICK RUGCHECK (non-blocking)
+// ========================================
+async function quickRugCheck(mint) {
+    try {
+        const res = await axios.get(
+            `https://api.rugcheck.xyz/v1/tokens/${mint}/report/summary`,
+            { timeout: 3000 }
+        );
+        const score = res.data?.score || 0; // Higher = riskier on rugcheck
+        const risks = res.data?.risks || [];
+
+        // Block only the worst flags
+        const criticalRisks = risks.filter((r) =>
+            ["freeze_authority", "mint_authority", "honeypot"].includes(r.name)
+        );
+
+        return {
+            score,
+            isCritical: criticalRisks.length > 0,
+            risks: risks.map((r) => r.name).slice(0, 3),
+            grade: score < 500 ? "✅ Good" : score < 1000 ? "⚠️ Caution" : "❌ Risky",
+        };
+    } catch {
+        // Don't block if rugcheck is down
+        return { score: null, isCritical: false, risks: [], grade: "❓ Unknown" };
+    }
+}
+
+// ========================================
+// 📦 PARSE SWAP TRANSACTION
+// ========================================
+async function parseSwapTx(signature, programId) {
     try {
         if (seenTx.has(signature)) return null;
         seenTx.add(signature);
 
-        const tx = await rateLimitedCall(() =>
-            connection.getParsedTransaction(signature, {
-                maxSupportedTransactionVersion: 0,
-                commitment: "confirmed",
-            })
-        );
+        const tx = await connection.getParsedTransaction(signature, {
+            maxSupportedTransactionVersion: 0,
+            commitment: "confirmed",
+        });
 
-        if (!tx || !tx.meta || tx.meta.err) return null;
+        if (!tx?.meta || tx.meta.err) return null;
 
-        const blockTime = tx.blockTime;
-        if (blockTime && Date.now() - blockTime * 1000 > MAX_AGE_MS) return null;
+        // Age check — only fresh txns
+        if (tx.blockTime && Date.now() - tx.blockTime * 1000 > MAX_AGE_MS) return null;
 
         const buyer = tx.transaction.message.accountKeys[0].pubkey.toString();
-        const preBalance = tx.meta.preBalances[0] || 0;
-        const postBalance = tx.meta.postBalances[0] || 0;
-        const solSpent = (preBalance - postBalance) / 1e9;
+        const solSpent =
+            (tx.meta.preBalances[0] - tx.meta.postBalances[0]) / 1e9;
 
         if (solSpent <= 0) return null;
 
@@ -148,225 +167,210 @@ async function parseSwapTransaction(signature, programId) {
         const buyUsd = solSpent * price;
         if (buyUsd < MIN_BUY_USD) return null;
 
+        // Find bought token
         const tokenBalances = tx.meta.postTokenBalances || [];
         let mint = null;
-
-        for (const balance of tokenBalances) {
-            if (balance.owner === buyer && balance.uiTokenAmount.uiAmount > 0) {
-                mint = balance.mint;
+        for (const bal of tokenBalances) {
+            if (bal.owner === buyer && bal.uiTokenAmount.uiAmount > 0) {
+                mint = bal.mint;
                 break;
             }
         }
 
         if (!mint) return null;
 
-        return {
-            mint,
-            buyer,
-            buyUsd,
-            solSpent,
-            signature,
-            dex: getDexName(programId),
-        };
-    } catch (err) {
+        return { mint, buyer, buyUsd, solSpent, signature, programId };
+    } catch {
         return null;
     }
 }
 
-function getDexName(programId) {
-    const id = programId.toString();
-    if (id === PROGRAMS.PUMPFUN.toString()) return "Pump.fun";
-    if (id === PROGRAMS.RAYDIUM_V4.toString()) return "Raydium";
-    if (id === PROGRAMS.JUPITER_V6.toString()) return "Jupiter";
-    return "Unknown";
-}
-
-/**
- * ========================================
- * 🔬 DEEP ANALYSIS FUNCTION
- * ========================================
- * Runs ALL security checks before alerting
- */
-async function performDeepAnalysis(mint, metadata) {
-    console.log(`🔬 Deep analyzing ${metadata.symbol}...`);
-
-    // Run all checks in parallel for speed
-    const [holders, creator, momentum, social, lpLock, rugcheck] = await Promise.all([
-        analyzeHolderDistribution(mint),
-        analyzeCreatorHistory(mint),
-        trackPriceMomentum(mint),
-        getSocialSentiment(mint, metadata.symbol),
-        verifyLPLock(mint),
-        checkRugRisk(mint),
-    ]);
-
-    console.log(`✅ Analysis complete for ${metadata.symbol}`);
-
-    return {
-        holders,
-        creator,
-        momentum,
-        social,
-        lpLock,
-        rugcheck,
-    };
-}
-
-/**
- * Calculate combined safety score
- */
-function calculateSafetyScore(analysis) {
-    let totalScore = 0;
-    let maxScore = 0;
-
-    // Holder distribution (20 points)
-    maxScore += 20;
-    totalScore += (100 - analysis.holders.riskScore) * 0.2;
-
-    // Creator trust (20 points)
-    maxScore += 20;
-    totalScore += analysis.creator.trustScore * 0.2;
-
-    // Social sentiment (15 points)
-    maxScore += 15;
-    totalScore += analysis.social.score * 0.15;
-
-    // LP Lock (20 points)
-    maxScore += 20;
-    totalScore += analysis.lpLock.safetyScore * 0.2;
-
-    // RugCheck (25 points) - most important
-    maxScore += 25;
-    totalScore += analysis.rugcheck.safetyScore * 0.25;
-
-    return Math.round(totalScore);
-}
-
-async function processWhaleBuy(data) {
-    const { mint, buyer, buyUsd, dex } = data;
-
-    if (alerted.has(mint)) return;
-
-    const whaleCount = recordWhale(mint, buyer);
-    if (whaleCount < MIN_WHALES) {
-        console.log(`🐋 ${whaleCount} whale(s) on ${mint.slice(0, 8)}...`);
-        return;
-    }
-
-    console.log(`🔥 ${whaleCount} whales on ${mint.slice(0, 8)}! Starting analysis...`);
-
-    const metadata = await getTokenMetadata(mint);
-    const liquidity = await getTokenLiquidity(mint);
-
-    // Basic alpha score
-    const alphaScore = scoreToken({
-        whaleCount,
-        liquidity,
-        marketCap: liquidity * 2,
-        sniperCount: 0,
-    });
-
-    if (alphaScore < MIN_SCORE) {
-        console.log(`⚠️  ${metadata.symbol} alpha score too low: ${alphaScore}`);
-        return;
-    }
-
-    // DEEP ANALYSIS with all security checks
-    const analysis = await performDeepAnalysis(mint, metadata);
-
-    // Calculate combined safety score
-    const safetyScore = calculateSafetyScore(analysis);
-
-    console.log(`📊 ${metadata.symbol} Safety Score: ${safetyScore}/100`);
-
-    // Check if token passes all filters
-    if (safetyScore < MIN_SAFETY_SCORE) {
-        console.log(`❌ ${metadata.symbol} failed safety check (${safetyScore}/100)`);
-        return;
-    }
-
-    // RugCheck critical check
-    if (REQUIRE_RUGCHECK && !isSafeToTrade(analysis.rugcheck)) {
-        console.log(`❌ ${metadata.symbol} failed RugCheck`);
-        return;
-    }
-
-    // Additional filters
-    if (!isSafeDistribution(analysis.holders)) {
-        console.log(`❌ ${metadata.symbol} has concentrated holders`);
-        return;
-    }
-
-    alerted.add(mint);
-
-    // BUILD COMPREHENSIVE ALERT
-    const alert =
-        `🚨 HIGH-QUALITY ALPHA DETECTED 🚨\n\n` +
-        `💎 ${metadata.name} ($${metadata.symbol})\n` +
-        `📍 ${mint}\n\n` +
-        `💰 Latest Buy: $${buyUsd.toFixed(0)} | 🟢 ${dex}\n` +
-        `🐋 Whales: ${whaleCount} | 💧 Liquidity: $${liquidity.toFixed(0)}\n\n` +
-        `⭐ ALPHA SCORE: ${alphaScore}/100\n` +
-        `🛡️ SAFETY SCORE: ${safetyScore}/100 ${getRiskEmoji(safetyScore)}\n\n` +
-        `📊 ANALYSIS:\n` +
-        `👥 Holders: ${analysis.holders.distribution} (Top: ${analysis.holders.topHolderPercent}%)\n` +
-        `🏗️ Creator: ${analysis.creator.grade} (${analysis.creator.tokensCreated} tokens)\n` +
-        `📈 Momentum: ${analysis.momentum.momentum}\n` +
-        `📱 Social: ${analysis.social.grade}\n` +
-        `🔒 LP Lock: ${analysis.lpLock.grade}\n` +
-        `⚠️ RugCheck: ${analysis.rugcheck.grade}\n\n` +
-        `${analysis.rugcheck.summary}\n\n` +
-        `🔗 Dex: https://dexscreener.com/solana/${mint}\n` +
-        `📊 Birdeye: https://birdeye.so/token/${mint}\n` +
-        `⚠️ RugCheck: https://rugcheck.xyz/tokens/${mint}`;
-
-    queueAlert(alert);
-
-    console.log(`✅ PREMIUM ALERT: ${metadata.symbol} | Alpha: ${alphaScore} | Safety: ${safetyScore}`);
-}
-
-async function scanProgram(programId) {
+// ========================================
+// 🐋 PROCESS WHALE BUY
+// ========================================
+async function processWhaleBuy(mint, buyer, buyUsd) {
     try {
-        const signatures = await rateLimitedCall(() =>
-            connection.getSignaturesForAddress(programId, { limit: 5 })
-        );
+        if (alerted.has(mint)) return;
+
+        // Track whale window
+        if (!whaleBuyers.has(mint)) {
+            whaleBuyers.set(mint, {
+                buyers: new Map(),
+                firstSeen: Date.now(),
+                totalVolume: 0,
+            });
+        }
+
+        const data = whaleBuyers.get(mint);
+
+        // Reset expired window
+        if (Date.now() - data.firstSeen > WINDOW_MS) {
+            data.buyers.clear();
+            data.firstSeen = Date.now();
+            data.totalVolume = 0;
+        }
+
+        data.buyers.set(buyer, (data.buyers.get(buyer) || 0) + buyUsd);
+        data.totalVolume += buyUsd;
+
+        const whaleCount = data.buyers.size;
+        const totalVolume = data.totalVolume;
+
+        const isBigSingleBuy = buyUsd >= BIG_SINGLE_BUY_USD && whaleCount === 1;
+        const isMultiWhale = whaleCount >= MIN_WHALES;
+
+        if (!isBigSingleBuy && !isMultiWhale) {
+            console.log(`🐋 ${whaleCount} whale(s) | $${buyUsd.toFixed(0)} | ${mint.slice(0, 8)}...`);
+            return;
+        }
+
+        // Fetch token info
+        const info = await getTokenInfo(mint);
+        if (!info) {
+            console.log(`❌ No DexScreener data for ${mint.slice(0, 8)}`);
+            return;
+        }
+
+        console.log(`🔥 ${info.symbol} | Whales: ${whaleCount} | Buy: $${buyUsd.toFixed(0)} | MCap: $${info.marketCap.toLocaleString()}`);
+
+        // Meme coin market filters
+        if (info.liquidity < MIN_LIQ) {
+            console.log(`❌ ${info.symbol} liq too low: $${info.liquidity}`);
+            return;
+        }
+        if (info.liquidity > MAX_LIQ) {
+            console.log(`❌ ${info.symbol} too established (liq $${info.liquidity.toLocaleString()})`);
+            return;
+        }
+        if (info.marketCap > MAX_MCAP) {
+            console.log(`❌ ${info.symbol} already mooned: $${info.marketCap.toLocaleString()}`);
+            return;
+        }
+
+        // Quick rugcheck (non-blocking)
+        const rug = await quickRugCheck(mint);
+
+        if (rug.isCritical) {
+            console.log(`❌ ${info.symbol} critical rug flag: ${rug.risks.join(", ")}`);
+            return;
+        }
+
+        alerted.add(mint);
+        totalAlerts++;
+
+        // Build alert
+        const triggerReason = isBigSingleBuy
+            ? `🐳 BIG BUY ($${buyUsd.toFixed(0)})`
+            : `🐋 ${whaleCount} WHALES IN 5MIN`;
+
+        const ageLine = info.ageHours !== null
+            ? `⏱️ Age: ${info.ageHours < 1
+                ? `${Math.round(info.ageHours * 60)}m`
+                : `${info.ageHours.toFixed(1)}h`}`
+            : `⏱️ Age: Unknown`;
+
+        const momentumLine = info.priceChange5m >= 0
+            ? `📈 +${info.priceChange5m}% (5m) | +${info.priceChange1h}% (1h)`
+            : `📉 ${info.priceChange5m}% (5m) | ${info.priceChange1h}% (1h)`;
+
+        const buyPressure = info.buys5m + info.sells5m > 0
+            ? `🟢 ${info.buys5m}B / 🔴 ${info.sells5m}S (5m)`
+            : "";
+
+        const alert =
+            `🚨 SOLANA MEME ALERT 🚨\n\n` +
+            `🐸 ${info.name} ($${info.symbol})\n` +
+            `📍 ${mint}\n\n` +
+            `${triggerReason}\n` +
+            `💰 Latest Buy: $${buyUsd.toFixed(0)}\n` +
+            `💼 Window Volume: $${totalVolume.toFixed(0)}\n\n` +
+            `💧 Liquidity: $${info.liquidity.toLocaleString()}\n` +
+            `📊 Market Cap: $${info.marketCap.toLocaleString()}\n` +
+            `${ageLine}\n` +
+            `${momentumLine}\n` +
+            `${buyPressure ? buyPressure + "\n" : ""}` +
+            `⚠️ RugCheck: ${rug.grade}${rug.risks.length ? ` (${rug.risks.join(", ")})` : ""}\n\n` +
+            `🔗 Dex: https://dexscreener.com/solana/${mint}\n` +
+            `🦅 Birdeye: https://birdeye.so/token/${mint}\n` +
+            `🔍 RugCheck: https://rugcheck.xyz/tokens/${mint}\n` +
+            `📱 Photon: https://photon-sol.tinyastro.io/en/lp/${info.pairAddress}`;
+
+        queueAlert(alert);
+        console.log(`✅ MEME ALERT #${totalAlerts}: ${info.symbol} | MCap: $${info.marketCap.toLocaleString()} | Rug: ${rug.grade}`);
+
+    } catch (err) {
+        console.log(`⚠️ processWhaleBuy error:`, err.message);
+    }
+}
+
+// ========================================
+// 🔄 SCAN PROGRAM
+// ========================================
+async function scanProgram(programId, label) {
+    try {
+        const signatures = await connection.getSignaturesForAddress(programId, {
+            limit: 10, // Grab more sigs per scan
+        });
 
         for (const sig of signatures) {
-            const data = await parseSwapTransaction(sig.signature, programId);
-            if (data) {
-                await processWhaleBuy(data);
+            const parsed = await parseSwapTx(sig.signature, programId);
+            if (parsed) {
+                await processWhaleBuy(parsed.mint, parsed.buyer, parsed.buyUsd);
             }
-            await new Promise((r) => setTimeout(r, 500));
+            await new Promise((r) => setTimeout(r, 300)); // Lighter delay
         }
+
+        totalScanned += signatures.length;
     } catch (err) {
-        console.log(`⚠️  Error scanning ${getDexName(programId)}`);
+        console.log(`⚠️ Error scanning ${label}:`, err.message);
     }
 }
 
-export function watchSolanaMomentum() {
-    console.log("🚀 ULTIMATE Multi-DEX Detector LIVE");
-    console.log("📡 Monitoring: Pump.fun, Raydium, Jupiter");
-    console.log("🔬 Advanced Analysis: Holders, Creator, Momentum, Social, LP Lock, RugCheck");
-    console.log("⏱️  Polling every 60s");
+// ========================================
+// 🎯 MAIN WATCHER
+// ========================================
+export function watchSolana() {
+    console.log("🟣 Solana Meme Coin Detector LIVE");
+    console.log(`💰 Min Buy: $${MIN_BUY_USD} | MCap: $${MIN_MCAP.toLocaleString()}-$${MAX_MCAP.toLocaleString()}`);
+    console.log("📡 Monitoring: Pump.fun, Raydium V4, Raydium CPMM");
 
     getSolPrice();
 
+    // Scan every 20s (faster than original 60s)
     setInterval(async () => {
-        console.log("🔄 Scanning with deep analysis...");
+        console.log(`\n🔄 Scanning... (${totalScanned} txns scanned so far)`);
 
-        await scanProgram(PROGRAMS.PUMPFUN);
-        await new Promise((r) => setTimeout(r, 2000));
+        await scanProgram(PROGRAMS.PUMPFUN, "Pump.fun");
+        await new Promise((r) => setTimeout(r, 1000));
 
-        await scanProgram(PROGRAMS.RAYDIUM_V4);
-        await new Promise((r) => setTimeout(r, 2000));
+        await scanProgram(PROGRAMS.RAYDIUM_V4, "Raydium V4");
+        await new Promise((r) => setTimeout(r, 1000));
 
-        await scanProgram(PROGRAMS.JUPITER_V6);
+        await scanProgram(PROGRAMS.RAYDIUM_CPMM, "Raydium CPMM");
 
-        console.log("✅ Scan complete");
-    }, 60000);
+        console.log(`✅ Scan done | ${totalAlerts} alerts fired`);
+    }, 20000);
 
+    // SOL price refresh every 60s
+    setInterval(getSolPrice, 60000);
+
+    // Cleanup
     setInterval(() => {
-        if (seenTx.size > 5000) seenTx.clear();
-        if (alerted.size > 500) alerted.clear();
-    }, 300000);
+        if (seenTx.size > 10000) {
+            seenTx.clear();
+            console.log("🧹 Cleared tx cache");
+        }
+        if (alerted.size > 1000) {
+            alerted.clear();
+            console.log("🧹 Cleared alert cache");
+        }
+        // Evict old whale windows
+        const now = Date.now();
+        for (const [mint, data] of whaleBuyers.entries()) {
+            if (now - data.firstSeen > WINDOW_MS * 3) {
+                whaleBuyers.delete(mint);
+            }
+        }
+        console.log(`📊 Status: ${whaleBuyers.size} tracked | ${alerted.size} alerted | ${totalScanned} scanned`);
+    }, 60000);
 }

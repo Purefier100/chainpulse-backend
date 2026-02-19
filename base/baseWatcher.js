@@ -1,263 +1,230 @@
 import { ethers } from "ethers";
 import axios from "axios";
-
 import { CONFIG } from "../config.js";
 import { getTokenMeta } from "./tokenCache.js";
 import { PAIR_ABI } from "./pairAbi.js";
-import { scoreToken } from "../utils/alphaScorer.js";
 import { queueAlert } from "../utils/alertQueue.js";
-
-// Import advanced security modules
-import {
-    analyzeBaseHolders,
-    isSafeBaseDistribution,
-    getBaseDistributionGrade,
-} from "../utils/baseHolderAnalyzer.js";
-import {
-    checkBaseSecurity,
-    isBaseSafeToTrade,
-    getBaseRiskEmoji,
-} from "../utils/baseSecurityChecker.js";
-import {
-    verifyBaseLPLock,
-    isBaseLPSafe,
-} from "../utils/baseLPLockVerifier.js";
-import {
-    trackPriceMomentum,
-    isPumpingNow,
-} from "../utils/momentumTracker.js";
-import {
-    getSocialSentiment,
-    hasGoodSocials,
-} from "../utils/socialSentiment.js";
 
 /**
  * ========================================
- * 🚀 ULTIMATE BASE WHALE DETECTOR
+ * 🐸 BASE MEME COIN WHALE DETECTOR
  * ========================================
- * With comprehensive security analysis
+ * Optimized for early meme coin detection
  */
 
-const provider = new ethers.WebSocketProvider(CONFIG.BASE_WSS);
+let provider = createProvider();
+
+function createProvider() {
+    const p = new ethers.WebSocketProvider(CONFIG.BASE_WSS);
+    p.on("error", (err) => {
+        console.error("❌ WSS Error:", err.message);
+        reconnect();
+    });
+    return p;
+}
+
+function reconnect() {
+    console.log("🔄 Reconnecting WSS...");
+    setTimeout(() => {
+        provider = createProvider();
+        startListening();
+    }, 3000);
+}
 
 const SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 
-// Filters
-const MIN_BUY_USD = 1000; // Lower since we have better filtering
-const MIN_WHALES = 2;
-const MIN_LIQ = 50000; // Lower threshold
-const MIN_MCAP = 100000; // Lower threshold
+// ✅ Meme-friendly thresholds
+const MIN_BUY_USD = 300;       // Catch $300+ buys
+const MIN_LIQ = 5000;          // Memes start with low liq
+const MAX_LIQ = 500000;        // Skip established tokens
+const MIN_MCAP = 10000;        // Very early stage
+const MAX_MCAP = 5000000;      // Skip if already mooned ($5M+)
+const MAX_TOKEN_AGE_HOURS = 48; // Only fresh tokens
 
-// Advanced filters
-const MIN_SCORE = 60; // Alpha score
-const MIN_SAFETY_SCORE = 50; // Combined safety score
-const REQUIRE_SECURITY_CHECK = true; // Require security pass
+// Known Base stablecoins/wrapped tokens to ignore
+const IGNORED_TOKENS = new Set([
+    "0x4200000000000000000000000000000000000006", // WETH
+    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC
+    "0x50c5725949a6f0c72e6c4a641f24049a917db0cb", // DAI
+    "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca", // USDbC
+]);
 
 const pairCache = new Map();
 const alerted = new Set();
 const whaleBuyers = new Map();
-const WINDOW = 10 * 60 * 1000;
+const WINDOW = 5 * 60 * 1000; // 5 min window for memes (faster)
+
+let totalSwapsDetected = 0;
+let totalAlertsTriggered = 0;
 
 async function getTokenStats(token) {
     try {
         const res = await axios.get(
             `https://api.dexscreener.com/latest/dex/tokens/${token}`,
-            { timeout: 5000 }
+            { timeout: 4000 }
         );
 
-        const pair = res.data.pairs?.[0];
-        if (!pair) return null;
+        const pairs = res.data.pairs;
+        if (!pairs?.length) return null;
+
+        // Pick the Base pair with most liquidity
+        const basePair = pairs
+            .filter((p) => p.chainId === "base")
+            .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+
+        if (!basePair) return null;
+
+        // Calculate token age
+        const createdAt = basePair.pairCreatedAt;
+        const ageHours = createdAt
+            ? (Date.now() - createdAt) / (1000 * 60 * 60)
+            : null;
 
         return {
-            liquidity: pair.liquidity?.usd || 0,
-            marketCap: pair.fdv || 0,
-            priceUsd: pair.priceUsd || 0,
-            pairAddress: pair.pairAddress,
+            liquidity: basePair.liquidity?.usd || 0,
+            marketCap: basePair.fdv || 0,
+            priceUsd: basePair.priceUsd || 0,
+            pairAddress: basePair.pairAddress,
+            ageHours,
+            priceChange5m: basePair.priceChange?.m5 || 0,
+            priceChange1h: basePair.priceChange?.h1 || 0,
+            txns5m: (basePair.txns?.m5?.buys || 0) + (basePair.txns?.m5?.sells || 0),
+            volume5m: basePair.volume?.m5 || 0,
+            name: basePair.baseToken?.name,
+            symbol: basePair.baseToken?.symbol,
         };
     } catch {
         return null;
     }
 }
 
-/**
- * ========================================
- * 🔬 DEEP SECURITY ANALYSIS
- * ========================================
- */
-async function performDeepAnalysis(tokenAddress, tokenSymbol, pairAddress) {
-    console.log(`🔬 Deep analyzing ${tokenSymbol} on Base...`);
-
-    const [holders, security, lpLock, momentum, social] = await Promise.all([
-        analyzeBaseHolders(tokenAddress, provider),
-        checkBaseSecurity(tokenAddress),
-        verifyBaseLPLock(tokenAddress, pairAddress),
-        trackPriceMomentum(tokenAddress),
-        getSocialSentiment(tokenAddress, tokenSymbol),
-    ]);
-
-    console.log(`✅ Analysis complete for ${tokenSymbol}`);
-
-    return {
-        holders,
-        security,
-        lpLock,
-        momentum,
-        social,
-    };
+async function quickHoneypotCheck(tokenAddress) {
+    try {
+        const res = await axios.get(
+            `https://api.honeypot.is/v2/IsHoneypot?address=${tokenAddress}&chainID=8453`,
+            { timeout: 3000 }
+        );
+        return {
+            isHoneypot: res.data.honeypotResult?.isHoneypot || false,
+            buyTax: res.data.simulationResult?.buyTax || 0,
+            sellTax: res.data.simulationResult?.sellTax || 0,
+        };
+    } catch {
+        // If check fails, don't block — just flag as unknown
+        return { isHoneypot: false, buyTax: null, sellTax: null };
+    }
 }
 
-/**
- * Calculate combined safety score
- */
-function calculateSafetyScore(analysis) {
-    let totalScore = 0;
-
-    // Holder distribution (25 points)
-    totalScore += (100 - analysis.holders.riskScore) * 0.25;
-
-    // Security check (35 points) - most important for Base
-    totalScore += analysis.security.safetyScore * 0.35;
-
-    // LP Lock (25 points)
-    totalScore += analysis.lpLock.safetyScore * 0.25;
-
-    // Social sentiment (15 points)
-    totalScore += analysis.social.score * 0.15;
-
-    return Math.round(totalScore);
-}
-
-/**
- * ========================================
- * 🐋 WHALE BUY PROCESSOR
- * ========================================
- */
-async function processWhaleBuy(tokenAddress, buyerAddress, buyUsd, meta, stats) {
+async function processWhaleBuy(tokenAddress, buyerAddress, buyUsd, stats) {
     try {
         if (alerted.has(tokenAddress)) return;
 
-        // Record whale
+        // Track buyers in window
         if (!whaleBuyers.has(tokenAddress)) {
             whaleBuyers.set(tokenAddress, {
-                buyers: new Set(),
+                buyers: new Map(), // address -> buyUsd
                 firstSeen: Date.now(),
+                totalVolume: 0,
             });
         }
 
         const data = whaleBuyers.get(tokenAddress);
 
+        // Reset window if expired
         if (Date.now() - data.firstSeen > WINDOW) {
             data.buyers.clear();
             data.firstSeen = Date.now();
+            data.totalVolume = 0;
         }
 
-        data.buyers.add(buyerAddress);
+        data.buyers.set(buyerAddress, (data.buyers.get(buyerAddress) || 0) + buyUsd);
+        data.totalVolume += buyUsd;
 
         const whaleCount = data.buyers.size;
-        if (whaleCount < MIN_WHALES) {
+        const totalVolume = data.totalVolume;
+
+        console.log(
+            `🐋 ${stats.symbol} | Buy: $${buyUsd.toFixed(0)} | Whales: ${whaleCount} | Vol: $${totalVolume.toFixed(0)} | MCap: $${stats.marketCap.toFixed(0)}`
+        );
+
+        // Alert on first big buy OR after 2+ whales
+        const isBigSingleBuy = buyUsd >= 2000 && whaleCount === 1;
+        const isMultiWhale = whaleCount >= 2;
+
+        if (!isBigSingleBuy && !isMultiWhale) return;
+
+        // Quick honeypot check (non-blocking on failure)
+        const honeypot = await quickHoneypotCheck(tokenAddress);
+
+        if (honeypot.isHoneypot) {
+            console.log(`🍯 HONEYPOT blocked: ${stats.symbol}`);
+            return;
+        }
+
+        // Block insane taxes
+        if (honeypot.buyTax > 10 || honeypot.sellTax > 10) {
             console.log(
-                `🐋 ${whaleCount} whale(s) on ${meta.symbol} - waiting for more...`
+                `❌ High tax blocked: ${stats.symbol} Buy: ${honeypot.buyTax}% Sell: ${honeypot.sellTax}%`
             );
             return;
         }
 
-        console.log(`🔥 ${whaleCount} whales on ${meta.symbol}! Starting analysis...`);
-
-        // Basic alpha score
-        const alphaScore = scoreToken({
-            whaleCount,
-            liquidity: stats.liquidity,
-            marketCap: stats.marketCap,
-            sniperCount: 0,
-        });
-
-        if (alphaScore < MIN_SCORE) {
-            console.log(`⚠️  ${meta.symbol} alpha score too low: ${alphaScore}`);
-            return;
-        }
-
-        // DEEP SECURITY ANALYSIS
-        const analysis = await performDeepAnalysis(
-            tokenAddress,
-            meta.symbol,
-            stats.pairAddress
-        );
-
-        // Calculate combined safety score
-        const safetyScore = calculateSafetyScore(analysis);
-
-        console.log(`📊 ${meta.symbol} Safety Score: ${safetyScore}/100`);
-
-        // Security checks
-        if (safetyScore < MIN_SAFETY_SCORE) {
-            console.log(`❌ ${meta.symbol} failed safety check (${safetyScore}/100)`);
-            return;
-        }
-
-        // Critical security check
-        if (REQUIRE_SECURITY_CHECK && !isBaseSafeToTrade(analysis.security)) {
-            console.log(`❌ ${meta.symbol} failed security check`);
-            return;
-        }
-
-        // Honeypot check (absolute blocker)
-        if (analysis.security.isHoneypot) {
-            console.log(`🍯 ${meta.symbol} is a HONEYPOT - blocking alert`);
-            return;
-        }
-
-        // Holder distribution check
-        if (!isSafeBaseDistribution(analysis.holders)) {
-            console.log(`❌ ${meta.symbol} has concentrated holders`);
-            return;
-        }
-
         alerted.add(tokenAddress);
+        totalAlertsTriggered++;
 
-        // BUILD COMPREHENSIVE ALERT
+        const triggerReason = isBigSingleBuy
+            ? `🐳 BIG SINGLE BUY ($${buyUsd.toFixed(0)})`
+            : `🐋 ${whaleCount} WHALES IN 5 MIN`;
+
+        const taxLine =
+            honeypot.buyTax !== null
+                ? `💸 Tax: Buy ${honeypot.buyTax}% / Sell ${honeypot.sellTax}%`
+                : `💸 Tax: Unverified`;
+
+        const ageLine =
+            stats.ageHours !== null
+                ? `⏱️ Age: ${stats.ageHours < 1 ? `${Math.round(stats.ageHours * 60)}m` : `${stats.ageHours.toFixed(1)}h`}`
+                : `⏱️ Age: Unknown`;
+
+        const momentumLine =
+            stats.priceChange5m > 0
+                ? `📈 +${stats.priceChange5m}% (5m) | +${stats.priceChange1h}% (1h)`
+                : `📉 ${stats.priceChange5m}% (5m) | ${stats.priceChange1h}% (1h)`;
+
         const alert =
-            `🚨 BASE HIGH-QUALITY ALPHA DETECTED 🚨\n\n` +
-            `💎 ${meta.name} ($${meta.symbol})\n` +
+            `🚨 BASE MEME ALERT 🚨\n\n` +
+            `🐸 ${stats.name} ($${stats.symbol})\n` +
             `📍 ${tokenAddress}\n\n` +
+            `${triggerReason}\n` +
             `💰 Latest Buy: $${buyUsd.toFixed(0)}\n` +
-            `🐋 Whales: ${whaleCount} | 💧 Liquidity: $${stats.liquidity.toFixed(0)}\n` +
-            `📈 Market Cap: $${stats.marketCap.toFixed(0)}\n\n` +
-            `⭐ ALPHA SCORE: ${alphaScore}/100\n` +
-            `🛡️ SAFETY SCORE: ${safetyScore}/100 ${getBaseRiskEmoji(safetyScore)}\n\n` +
-            `📊 SECURITY ANALYSIS:\n` +
-            `👥 Holders: ${analysis.holders.distribution} (Top: ${analysis.holders.topHolderPercent}%)\n` +
-            `🍯 Honeypot: ${analysis.security.isHoneypot ? "YES ❌" : "NO ✅"}\n` +
-            `💸 Buy Tax: ${analysis.security.buyTax}% | Sell Tax: ${analysis.security.sellTax}%\n` +
-            `📈 Momentum: ${analysis.momentum.momentum}\n` +
-            `📱 Social: ${analysis.social.grade}\n` +
-            `🔒 LP Lock: ${analysis.lpLock.grade}\n\n` +
-            `${analysis.security.summary}\n\n` +
+            `💼 Window Volume: $${totalVolume.toFixed(0)}\n\n` +
+            `💧 Liquidity: $${stats.liquidity.toLocaleString()}\n` +
+            `📊 Market Cap: $${stats.marketCap.toLocaleString()}\n` +
+            `${ageLine}\n` +
+            `${momentumLine}\n` +
+            `${taxLine}\n\n` +
             `🔗 Dex: https://dexscreener.com/base/${tokenAddress}\n` +
-            `📊 Chart: https://www.dextools.io/app/base/pair-explorer/${stats.pairAddress}`;
+            `📊 Chart: https://www.dextools.io/app/base/pair-explorer/${stats.pairAddress}\n` +
+            `🦅 Maestro: https://t.me/MaestroSniperBot?start=${tokenAddress}`;
 
         queueAlert(alert);
+        console.log(`✅ MEME ALERT #${totalAlertsTriggered}: ${stats.symbol} | MCap: $${stats.marketCap.toLocaleString()}`);
 
-        console.log(
-            `✅ BASE PREMIUM ALERT: ${meta.symbol} | Alpha: ${alphaScore} | Safety: ${safetyScore}`
-        );
     } catch (err) {
-        console.log(`⚠️  Base whale processing error:`, err.message);
+        console.log(`⚠️ processWhaleBuy error:`, err.message);
     }
 }
 
-/**
- * ========================================
- * 🎯 MAIN WATCHER
- * ========================================
- */
-export function watchBase() {
-    console.log("🟦 ULTIMATE Base Whale Detector LIVE");
-    console.log(
-        "🔬 Advanced Analysis: Holders, Security, Honeypot, LP Lock, Momentum, Social"
-    );
+function startListening() {
+    console.log("🐸 Listening for Base meme swaps...");
 
     provider.on({ topics: [SWAP_TOPIC] }, async (log) => {
         try {
+            totalSwapsDetected++;
+            if (totalSwapsDetected % 500 === 0) {
+                console.log(`📡 ${totalSwapsDetected} swaps scanned | ${totalAlertsTriggered} alerts fired`);
+            }
+
             const pairAddr = log.address.toLowerCase();
 
             let token0, token1;
@@ -266,67 +233,75 @@ export function watchBase() {
                 ({ token0, token1 } = pairCache.get(pairAddr));
             } else {
                 const pair = new ethers.Contract(pairAddr, PAIR_ABI, provider);
-
                 try {
-                    token0 = await pair.token0();
-                    token1 = await pair.token1();
+                    [token0, token1] = await Promise.all([pair.token0(), pair.token1()]);
+                    token0 = token0.toLowerCase();
+                    token1 = token1.toLowerCase();
                 } catch {
                     return;
                 }
-
                 pairCache.set(pairAddr, { token0, token1 });
             }
 
             const iface = new ethers.Interface(PAIR_ABI);
             const decoded = iface.parseLog(log);
-
             const { amount0Out, amount1Out, to } = decoded.args;
 
-            let boughtToken, raw;
-
-            if (amount0Out > 0n) {
+            // Determine which token was bought
+            let boughtToken;
+            if (amount0Out > 0n && !IGNORED_TOKENS.has(token0)) {
                 boughtToken = token0;
-                raw = amount0Out;
-            } else {
+            } else if (amount1Out > 0n && !IGNORED_TOKENS.has(token1)) {
                 boughtToken = token1;
-                raw = amount1Out;
+            } else {
+                return; // Buying a stable/WETH — not a meme
             }
 
             if (alerted.has(boughtToken)) return;
 
+            // Fetch stats
             const stats = await getTokenStats(boughtToken);
             if (!stats) return;
 
-            if (stats.liquidity < MIN_LIQ) return;
-            if (stats.marketCap < MIN_MCAP) return;
+            // Meme coin filters
+            if (stats.liquidity < MIN_LIQ || stats.liquidity > MAX_LIQ) return;
+            if (stats.marketCap < MIN_MCAP || stats.marketCap > MAX_MCAP) return;
+            if (stats.ageHours !== null && stats.ageHours > MAX_TOKEN_AGE_HOURS) return;
 
-            const meta = await getTokenMeta(provider, boughtToken);
-            if (!meta?.symbol) return;
-
-            const amount = Number(ethers.formatUnits(raw, meta.decimals));
+            // Calculate buy size
+            const decimals = 18; // Default, good enough for USD calc via priceUsd
+            const amountOut = amount0Out > 0n ? amount0Out : amount1Out;
+            const amount = Number(ethers.formatUnits(amountOut, decimals));
             const buyUsd = amount * Number(stats.priceUsd);
 
             if (buyUsd < MIN_BUY_USD) return;
 
-            // Process whale buy with deep analysis
-            await processWhaleBuy(boughtToken, to, buyUsd, meta, stats);
+            await processWhaleBuy(boughtToken, to.toLowerCase(), buyUsd, stats);
+
         } catch (err) {
-            console.log("Base detector error:", err.message);
+            // Silent — high volume, errors expected
         }
     });
+}
 
-    // Cleanup old whale data
+export function watchBase() {
+    console.log("🟦 Base Meme Coin Detector LIVE");
+    console.log(`💰 Min Buy: $${MIN_BUY_USD} | Liq: $${MIN_LIQ}-$${MAX_LIQ} | MCap: $${MIN_MCAP}-$${MAX_MCAP}`);
+
+    startListening();
+
+    // Cleanup
     setInterval(() => {
         const now = Date.now();
         for (const [token, data] of whaleBuyers.entries()) {
-            if (now - data.firstSeen > WINDOW * 2) {
+            if (now - data.firstSeen > WINDOW * 3) {
                 whaleBuyers.delete(token);
             }
         }
-
-        if (alerted.size > 500) {
+        if (alerted.size > 1000) {
             alerted.clear();
-            console.log("🧹 Cleared Base alert cache");
+            console.log("🧹 Cleared alert cache");
         }
-    }, 300000);
+        console.log(`📊 Status: ${whaleBuyers.size} tracked tokens | ${alerted.size} alerted`);
+    }, 60000);
 }
