@@ -4,15 +4,6 @@ import { CONFIG } from "../config.js";
 import { PAIR_ABI } from "./pairAbi.js";
 import { queueAlert } from "../utils/alertQueue.js";
 
-/**
- * ========================================
- * 🐸 BASE MEME COIN DETECTOR (FIXED)
- * ========================================
- * Fix: buyUsd was calculated from meme token amountOut * priceUsd
- *      which produces garbage (meme token decimals != 18 always,
- *      and quantity * its own price ≠ ETH spent)
- * Fix: Now reads the ETH/USDC INPUT side of the swap for accurate USD
- */
 
 let provider = createProvider();
 
@@ -121,9 +112,7 @@ async function getTokenStats(token) {
     }
 }
 
-// ========================================
-// 🍯 HONEYPOT CHECK
-// ========================================
+
 async function quickHoneypotCheck(tokenAddress) {
     try {
         const res = await axios.get(
@@ -140,9 +129,7 @@ async function quickHoneypotCheck(tokenAddress) {
     }
 }
 
-// ========================================
-// 🐋 PROCESS WHALE BUY
-// ========================================
+
 async function processWhaleBuy(tokenAddress, buyerAddress, buyUsd, stats) {
     try {
         if (alerted.has(tokenAddress)) return;
@@ -238,9 +225,7 @@ async function processWhaleBuy(tokenAddress, buyerAddress, buyUsd, stats) {
     }
 }
 
-// ========================================
-// 🎯 SWAP LISTENER
-// ========================================
+
 function startListening() {
     console.log("🐸 Listening for Base meme swaps...");
 
@@ -272,19 +257,6 @@ function startListening() {
             const decoded = iface.parseLog(log);
             const { amount0In, amount1In, amount0Out, amount1Out, to } = decoded.args;
 
-            /**
-             * ✅ FIX: Correct buy USD calculation
-             *
-             * Uniswap V2 Swap event:
-             *   amount0In / amount1In  = tokens going INTO the pool (what buyer spent)
-             *   amount0Out / amount1Out = tokens coming OUT of the pool (what buyer received)
-             *
-             * To find what the buyer SPENT (in ETH/USDC):
-             *   - If token0 is WETH/stable → buyer spent amount0In of token0
-             *   - If token1 is WETH/stable → buyer spent amount1In of token1
-             *
-             * Then convert that ETH/USDC amount to USD.
-             */
 
             let boughtToken = null;
             let buyUsd = 0;
@@ -331,9 +303,7 @@ function startListening() {
     });
 }
 
-// ========================================
-// 🎯 MAIN WATCHER
-// ========================================
+
 export function watchBase() {
     console.log("🟦 Base Meme Detector LIVE (Fixed)");
     console.log(`💰 Min Buy: $${MIN_BUY_USD} | Liq: $${MIN_LIQ}-$${MAX_LIQ} | MCap: $${MIN_MCAP}-$${MAX_MCAP}`);

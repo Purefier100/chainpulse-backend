@@ -3,13 +3,6 @@ import axios from "axios";
 import { CONFIG } from "../config.js";
 import { queueAlert } from "../utils/alertQueue.js";
 
-/**
- * ========================================
- * 🐸 SOLANA MEME COIN DETECTOR (FIXED)
- * ========================================
- * Fix: seenTx was blocking all re-scanned sigs permanently
- * Fix: MAX_AGE_MS was too tight, rejecting valid fresh txns
- */
 
 const connection = new Connection(CONFIG.SOLANA_RPC, "confirmed");
 
@@ -24,9 +17,7 @@ const MIN_WHALES = 2;
 const BIG_SINGLE_BUY_USD = 2000;
 const WINDOW_MS = 5 * 60 * 1000;
 
-// ✅ FIX 1: Increased from 30s to 3min
-// 30s was too tight — by the time getParsedTransaction resolves,
-// the txn is already "old". 3min catches real fresh activity.
+
 const MAX_AGE_MS = 3 * 60 * 1000;
 
 const MIN_MCAP = 10000;
@@ -39,16 +30,14 @@ let lastSolUpdate = 0;
 
 const alerted = new Set();
 
-// ✅ FIX 2: seenTx now stores timestamp, not just presence
-// This lets us expire old entries instead of blocking forever
+
 const seenTx = new Map(); // signature -> timestamp
 const SEEN_TX_TTL = 10 * 60 * 1000; // forget txns after 10 min
 
 const whaleBuyers = new Map();
 const tokenMetaCache = new Map();
 
-// ✅ FIX 3: Track the last seen signature per program
-// So we only fetch NEW signatures each scan, not the same 10
+
 const lastSignature = {
     PUMPFUN: null,
     RAYDIUM_V4: null,
@@ -58,9 +47,7 @@ const lastSignature = {
 let totalScanned = 0;
 let totalAlerts = 0;
 
-// ========================================
-// 💰 SOL PRICE
-// ========================================
+
 async function getSolPrice() {
     if (Date.now() - lastSolUpdate < 60000 && solPrice > 0) return solPrice;
     try {
@@ -77,9 +64,7 @@ async function getSolPrice() {
     return solPrice;
 }
 
-// ========================================
-// 🔍 TOKEN INFO
-// ========================================
+
 async function getTokenInfo(mint) {
     if (tokenMetaCache.has(mint)) return tokenMetaCache.get(mint);
 
@@ -123,9 +108,7 @@ async function getTokenInfo(mint) {
     }
 }
 
-// ========================================
-// 🍯 RUGCHECK
-// ========================================
+
 async function quickRugCheck(mint) {
     try {
         const res = await axios.get(
@@ -148,9 +131,7 @@ async function quickRugCheck(mint) {
     }
 }
 
-// ========================================
-// 📦 PARSE SWAP TX
-// ========================================
+
 async function parseSwapTx(signature) {
     // ✅ FIX 2 cont: check TTL, not just presence
     if (seenTx.has(signature)) return null;
@@ -191,9 +172,7 @@ async function parseSwapTx(signature) {
     }
 }
 
-// ========================================
-// 🐋 PROCESS WHALE BUY
-// ========================================
+
 async function processWhaleBuy(mint, buyer, buyUsd) {
     try {
         if (alerted.has(mint)) return;
@@ -285,9 +264,7 @@ async function processWhaleBuy(mint, buyer, buyUsd) {
     }
 }
 
-// ========================================
-// 🔄 SCAN PROGRAM
-// ========================================
+
 async function scanProgram(programId, label, lastSigKey) {
     try {
         const options = { limit: 15 };
@@ -324,9 +301,7 @@ async function scanProgram(programId, label, lastSigKey) {
     }
 }
 
-// ========================================
-// 🎯 MAIN WATCHER
-// ========================================
+
 export function watchSolana() {
     console.log("🟣 Solana Meme Detector LIVE (Fixed)");
     console.log(`💰 Min Buy: $${MIN_BUY_USD} | MCap: $${MIN_MCAP.toLocaleString()}-$${MAX_MCAP.toLocaleString()}`);
