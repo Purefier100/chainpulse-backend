@@ -5,9 +5,10 @@ import { queueAlert } from "../utils/alertQueue.js";
 
 /**
  * ========================================
- * 🐸 SOLANA MEME COIN DETECTOR
+ * 🐸 SOLANA MEME COIN DETECTOR (FIXED)
  * ========================================
- * Optimized for early meme detection
+ * Fix: seenTx was blocking all re-scanned sigs permanently
+ * Fix: MAX_AGE_MS was too tight, rejecting valid fresh txns
  */
 
 const connection = new Connection(CONFIG.SOLANA_RPC, "confirmed");
@@ -18,28 +19,41 @@ const PROGRAMS = {
     RAYDIUM_CPMM: new PublicKey("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"),
 };
 
-// ✅ Meme-friendly thresholds
-const MIN_BUY_USD = 200;           // Catch $200+ buys
-const MIN_WHALES = 2;              // 2 unique whales in window
-const BIG_SINGLE_BUY_USD = 2000;  // OR one massive buy
-const WINDOW_MS = 5 * 60 * 1000;  // 5 min accumulation window
-const MAX_AGE_MS = 30000;         // Only last 30s txns (fresh)
+const MIN_BUY_USD = 200;
+const MIN_WHALES = 2;
+const BIG_SINGLE_BUY_USD = 2000;
+const WINDOW_MS = 5 * 60 * 1000;
 
-// Market cap filters — meme sweet spot
+// ✅ FIX 1: Increased from 30s to 3min
+// 30s was too tight — by the time getParsedTransaction resolves,
+// the txn is already "old". 3min catches real fresh activity.
+const MAX_AGE_MS = 3 * 60 * 1000;
+
 const MIN_MCAP = 10000;
-const MAX_MCAP = 10000000; // Skip anything over $10M (already mooned)
+const MAX_MCAP = 10000000;
 const MIN_LIQ = 3000;
 const MAX_LIQ = 300000;
 
-// SOL price cache
 let solPrice = 140;
 let lastSolUpdate = 0;
 
-// State
 const alerted = new Set();
-const seenTx = new Set();
-const whaleBuyers = new Map(); // mint -> { buyers: Map, firstSeen, totalVolume }
+
+// ✅ FIX 2: seenTx now stores timestamp, not just presence
+// This lets us expire old entries instead of blocking forever
+const seenTx = new Map(); // signature -> timestamp
+const SEEN_TX_TTL = 10 * 60 * 1000; // forget txns after 10 min
+
+const whaleBuyers = new Map();
 const tokenMetaCache = new Map();
+
+// ✅ FIX 3: Track the last seen signature per program
+// So we only fetch NEW signatures each scan, not the same 10
+const lastSignature = {
+    PUMPFUN: null,
+    RAYDIUM_V4: null,
+    RAYDIUM_CPMM: null,
+};
 
 let totalScanned = 0;
 let totalAlerts = 0;
@@ -64,7 +78,7 @@ async function getSolPrice() {
 }
 
 // ========================================
-// 🔍 TOKEN METADATA (DexScreener first, RPC fallback)
+// 🔍 TOKEN INFO
 // ========================================
 async function getTokenInfo(mint) {
     if (tokenMetaCache.has(mint)) return tokenMetaCache.get(mint);
@@ -102,7 +116,6 @@ async function getTokenInfo(mint) {
         };
 
         tokenMetaCache.set(mint, info);
-        // Cache for only 2 min (meme prices move fast)
         setTimeout(() => tokenMetaCache.delete(mint), 120000);
         return info;
     } catch {
@@ -111,7 +124,7 @@ async function getTokenInfo(mint) {
 }
 
 // ========================================
-// 🍯 QUICK RUGCHECK (non-blocking)
+// 🍯 RUGCHECK
 // ========================================
 async function quickRugCheck(mint) {
     try {
@@ -119,14 +132,11 @@ async function quickRugCheck(mint) {
             `https://api.rugcheck.xyz/v1/tokens/${mint}/report/summary`,
             { timeout: 3000 }
         );
-        const score = res.data?.score || 0; // Higher = riskier on rugcheck
+        const score = res.data?.score || 0;
         const risks = res.data?.risks || [];
-
-        // Block only the worst flags
         const criticalRisks = risks.filter((r) =>
             ["freeze_authority", "mint_authority", "honeypot"].includes(r.name)
         );
-
         return {
             score,
             isCritical: criticalRisks.length > 0,
@@ -134,19 +144,19 @@ async function quickRugCheck(mint) {
             grade: score < 500 ? "✅ Good" : score < 1000 ? "⚠️ Caution" : "❌ Risky",
         };
     } catch {
-        // Don't block if rugcheck is down
         return { score: null, isCritical: false, risks: [], grade: "❓ Unknown" };
     }
 }
 
 // ========================================
-// 📦 PARSE SWAP TRANSACTION
+// 📦 PARSE SWAP TX
 // ========================================
-async function parseSwapTx(signature, programId) {
-    try {
-        if (seenTx.has(signature)) return null;
-        seenTx.add(signature);
+async function parseSwapTx(signature) {
+    // ✅ FIX 2 cont: check TTL, not just presence
+    if (seenTx.has(signature)) return null;
+    seenTx.set(signature, Date.now());
 
+    try {
         const tx = await connection.getParsedTransaction(signature, {
             maxSupportedTransactionVersion: 0,
             commitment: "confirmed",
@@ -154,20 +164,17 @@ async function parseSwapTx(signature, programId) {
 
         if (!tx?.meta || tx.meta.err) return null;
 
-        // Age check — only fresh txns
+        // ✅ FIX 1 cont: use expanded MAX_AGE_MS
         if (tx.blockTime && Date.now() - tx.blockTime * 1000 > MAX_AGE_MS) return null;
 
         const buyer = tx.transaction.message.accountKeys[0].pubkey.toString();
-        const solSpent =
-            (tx.meta.preBalances[0] - tx.meta.postBalances[0]) / 1e9;
-
+        const solSpent = (tx.meta.preBalances[0] - tx.meta.postBalances[0]) / 1e9;
         if (solSpent <= 0) return null;
 
         const price = await getSolPrice();
         const buyUsd = solSpent * price;
         if (buyUsd < MIN_BUY_USD) return null;
 
-        // Find bought token
         const tokenBalances = tx.meta.postTokenBalances || [];
         let mint = null;
         for (const bal of tokenBalances) {
@@ -178,8 +185,7 @@ async function parseSwapTx(signature, programId) {
         }
 
         if (!mint) return null;
-
-        return { mint, buyer, buyUsd, solSpent, signature, programId };
+        return { mint, buyer, buyUsd };
     } catch {
         return null;
     }
@@ -192,7 +198,6 @@ async function processWhaleBuy(mint, buyer, buyUsd) {
     try {
         if (alerted.has(mint)) return;
 
-        // Track whale window
         if (!whaleBuyers.has(mint)) {
             whaleBuyers.set(mint, {
                 buyers: new Map(),
@@ -203,7 +208,6 @@ async function processWhaleBuy(mint, buyer, buyUsd) {
 
         const data = whaleBuyers.get(mint);
 
-        // Reset expired window
         if (Date.now() - data.firstSeen > WINDOW_MS) {
             data.buyers.clear();
             data.firstSeen = Date.now();
@@ -224,49 +228,27 @@ async function processWhaleBuy(mint, buyer, buyUsd) {
             return;
         }
 
-        // Fetch token info
         const info = await getTokenInfo(mint);
-        if (!info) {
-            console.log(`❌ No DexScreener data for ${mint.slice(0, 8)}`);
-            return;
-        }
+        if (!info) { console.log(`❌ No data for ${mint.slice(0, 8)}`); return; }
 
-        console.log(`🔥 ${info.symbol} | Whales: ${whaleCount} | Buy: $${buyUsd.toFixed(0)} | MCap: $${info.marketCap.toLocaleString()}`);
+        console.log(`🔥 ${info.symbol} | Whales: ${whaleCount} | $${buyUsd.toFixed(0)} | MCap: $${info.marketCap.toLocaleString()}`);
 
-        // Meme coin market filters
-        if (info.liquidity < MIN_LIQ) {
-            console.log(`❌ ${info.symbol} liq too low: $${info.liquidity}`);
-            return;
-        }
-        if (info.liquidity > MAX_LIQ) {
-            console.log(`❌ ${info.symbol} too established (liq $${info.liquidity.toLocaleString()})`);
-            return;
-        }
-        if (info.marketCap > MAX_MCAP) {
-            console.log(`❌ ${info.symbol} already mooned: $${info.marketCap.toLocaleString()}`);
-            return;
-        }
+        if (info.liquidity < MIN_LIQ) { console.log(`❌ ${info.symbol} liq too low`); return; }
+        if (info.liquidity > MAX_LIQ) { console.log(`❌ ${info.symbol} too established`); return; }
+        if (info.marketCap > MAX_MCAP) { console.log(`❌ ${info.symbol} already mooned`); return; }
 
-        // Quick rugcheck (non-blocking)
         const rug = await quickRugCheck(mint);
-
-        if (rug.isCritical) {
-            console.log(`❌ ${info.symbol} critical rug flag: ${rug.risks.join(", ")}`);
-            return;
-        }
+        if (rug.isCritical) { console.log(`❌ ${info.symbol} rug flag: ${rug.risks.join(", ")}`); return; }
 
         alerted.add(mint);
         totalAlerts++;
 
-        // Build alert
         const triggerReason = isBigSingleBuy
             ? `🐳 BIG BUY ($${buyUsd.toFixed(0)})`
             : `🐋 ${whaleCount} WHALES IN 5MIN`;
 
         const ageLine = info.ageHours !== null
-            ? `⏱️ Age: ${info.ageHours < 1
-                ? `${Math.round(info.ageHours * 60)}m`
-                : `${info.ageHours.toFixed(1)}h`}`
+            ? `⏱️ Age: ${info.ageHours < 1 ? `${Math.round(info.ageHours * 60)}m` : `${info.ageHours.toFixed(1)}h`}`
             : `⏱️ Age: Unknown`;
 
         const momentumLine = info.priceChange5m >= 0
@@ -274,7 +256,7 @@ async function processWhaleBuy(mint, buyer, buyUsd) {
             : `📉 ${info.priceChange5m}% (5m) | ${info.priceChange1h}% (1h)`;
 
         const buyPressure = info.buys5m + info.sells5m > 0
-            ? `🟢 ${info.buys5m}B / 🔴 ${info.sells5m}S (5m)`
+            ? `🟢 ${info.buys5m}B / 🔴 ${info.sells5m}S (5m)\n`
             : "";
 
         const alert =
@@ -288,7 +270,7 @@ async function processWhaleBuy(mint, buyer, buyUsd) {
             `📊 Market Cap: $${info.marketCap.toLocaleString()}\n` +
             `${ageLine}\n` +
             `${momentumLine}\n` +
-            `${buyPressure ? buyPressure + "\n" : ""}` +
+            `${buyPressure}` +
             `⚠️ RugCheck: ${rug.grade}${rug.risks.length ? ` (${rug.risks.join(", ")})` : ""}\n\n` +
             `🔗 Dex: https://dexscreener.com/solana/${mint}\n` +
             `🦅 Birdeye: https://birdeye.so/token/${mint}\n` +
@@ -296,7 +278,7 @@ async function processWhaleBuy(mint, buyer, buyUsd) {
             `📱 Photon: https://photon-sol.tinyastro.io/en/lp/${info.pairAddress}`;
 
         queueAlert(alert);
-        console.log(`✅ MEME ALERT #${totalAlerts}: ${info.symbol} | MCap: $${info.marketCap.toLocaleString()} | Rug: ${rug.grade}`);
+        console.log(`✅ ALERT #${totalAlerts}: ${info.symbol} | MCap: $${info.marketCap.toLocaleString()}`);
 
     } catch (err) {
         console.log(`⚠️ processWhaleBuy error:`, err.message);
@@ -306,18 +288,34 @@ async function processWhaleBuy(mint, buyer, buyUsd) {
 // ========================================
 // 🔄 SCAN PROGRAM
 // ========================================
-async function scanProgram(programId, label) {
+async function scanProgram(programId, label, lastSigKey) {
     try {
-        const signatures = await connection.getSignaturesForAddress(programId, {
-            limit: 10, // Grab more sigs per scan
-        });
+        const options = { limit: 15 };
+
+        // ✅ FIX 3: Only fetch signatures NEWER than last seen
+        if (lastSignature[lastSigKey]) {
+            options.until = lastSignature[lastSigKey];
+        }
+
+        const signatures = await connection.getSignaturesForAddress(programId, options);
+
+        if (signatures.length === 0) {
+            console.log(`📡 ${label}: No new txns since last scan`);
+            return;
+        }
+
+        // Update cursor to newest sig
+        lastSignature[lastSigKey] = signatures[0].signature;
+
+        console.log(`📡 ${label}: ${signatures.length} new txns`);
 
         for (const sig of signatures) {
-            const parsed = await parseSwapTx(sig.signature, programId);
+            if (sig.err) continue; // Skip failed txns immediately
+            const parsed = await parseSwapTx(sig.signature);
             if (parsed) {
                 await processWhaleBuy(parsed.mint, parsed.buyer, parsed.buyUsd);
             }
-            await new Promise((r) => setTimeout(r, 300)); // Lighter delay
+            await new Promise((r) => setTimeout(r, 200));
         }
 
         totalScanned += signatures.length;
@@ -330,47 +328,48 @@ async function scanProgram(programId, label) {
 // 🎯 MAIN WATCHER
 // ========================================
 export function watchSolana() {
-    console.log("🟣 Solana Meme Coin Detector LIVE");
+    console.log("🟣 Solana Meme Detector LIVE (Fixed)");
     console.log(`💰 Min Buy: $${MIN_BUY_USD} | MCap: $${MIN_MCAP.toLocaleString()}-$${MAX_MCAP.toLocaleString()}`);
-    console.log("📡 Monitoring: Pump.fun, Raydium V4, Raydium CPMM");
+    console.log("📡 Monitoring: Pump.fun | Raydium V4 | Raydium CPMM");
+    console.log("🔧 Fixes: cursor-based scanning, TTL tx cache, expanded age window");
 
     getSolPrice();
 
-    // Scan every 20s (faster than original 60s)
     setInterval(async () => {
-        console.log(`\n🔄 Scanning... (${totalScanned} txns scanned so far)`);
+        console.log(`\n🔄 Scanning... (${totalScanned} total | ${totalAlerts} alerts)`);
 
-        await scanProgram(PROGRAMS.PUMPFUN, "Pump.fun");
-        await new Promise((r) => setTimeout(r, 1000));
+        await scanProgram(PROGRAMS.PUMPFUN, "Pump.fun", "PUMPFUN");
+        await new Promise((r) => setTimeout(r, 800));
 
-        await scanProgram(PROGRAMS.RAYDIUM_V4, "Raydium V4");
-        await new Promise((r) => setTimeout(r, 1000));
+        await scanProgram(PROGRAMS.RAYDIUM_V4, "Raydium V4", "RAYDIUM_V4");
+        await new Promise((r) => setTimeout(r, 800));
 
-        await scanProgram(PROGRAMS.RAYDIUM_CPMM, "Raydium CPMM");
+        await scanProgram(PROGRAMS.RAYDIUM_CPMM, "Raydium CPMM", "RAYDIUM_CPMM");
 
-        console.log(`✅ Scan done | ${totalAlerts} alerts fired`);
+        console.log(`✅ Scan done`);
     }, 20000);
 
-    // SOL price refresh every 60s
     setInterval(getSolPrice, 60000);
 
     // Cleanup
     setInterval(() => {
-        if (seenTx.size > 10000) {
-            seenTx.clear();
-            console.log("🧹 Cleared tx cache");
-        }
-        if (alerted.size > 1000) {
-            alerted.clear();
-            console.log("🧹 Cleared alert cache");
-        }
-        // Evict old whale windows
+        // ✅ FIX 2 cont: Expire seenTx entries by TTL instead of clearing all
         const now = Date.now();
-        for (const [mint, data] of whaleBuyers.entries()) {
-            if (now - data.firstSeen > WINDOW_MS * 3) {
-                whaleBuyers.delete(mint);
+        let expired = 0;
+        for (const [sig, ts] of seenTx.entries()) {
+            if (now - ts > SEEN_TX_TTL) {
+                seenTx.delete(sig);
+                expired++;
             }
         }
-        console.log(`📊 Status: ${whaleBuyers.size} tracked | ${alerted.size} alerted | ${totalScanned} scanned`);
+        if (expired > 0) console.log(`🧹 Expired ${expired} old tx entries`);
+
+        if (alerted.size > 1000) { alerted.clear(); console.log("🧹 Cleared alert cache"); }
+
+        for (const [mint, data] of whaleBuyers.entries()) {
+            if (now - data.firstSeen > WINDOW_MS * 3) whaleBuyers.delete(mint);
+        }
+
+        console.log(`📊 Status: ${whaleBuyers.size} tracked | ${alerted.size} alerted | seenTx: ${seenTx.size}`);
     }, 60000);
 }

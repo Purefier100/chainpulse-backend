@@ -1,15 +1,17 @@
 import { ethers } from "ethers";
 import axios from "axios";
 import { CONFIG } from "../config.js";
-import { getTokenMeta } from "./tokenCache.js";
 import { PAIR_ABI } from "./pairAbi.js";
 import { queueAlert } from "../utils/alertQueue.js";
 
 /**
  * ========================================
- * 🐸 BASE MEME COIN WHALE DETECTOR
+ * 🐸 BASE MEME COIN DETECTOR (FIXED)
  * ========================================
- * Optimized for early meme coin detection
+ * Fix: buyUsd was calculated from meme token amountOut * priceUsd
+ *      which produces garbage (meme token decimals != 18 always,
+ *      and quantity * its own price ≠ ETH spent)
+ * Fix: Now reads the ETH/USDC INPUT side of the swap for accurate USD
  */
 
 let provider = createProvider();
@@ -33,30 +35,52 @@ function reconnect() {
 
 const SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 
-// ✅ Meme-friendly thresholds
-const MIN_BUY_USD = 300;       // Catch $300+ buys
-const MIN_LIQ = 5000;          // Memes start with low liq
-const MAX_LIQ = 500000;        // Skip established tokens
-const MIN_MCAP = 10000;        // Very early stage
-const MAX_MCAP = 5000000;      // Skip if already mooned ($5M+)
-const MAX_TOKEN_AGE_HOURS = 48; // Only fresh tokens
+const MIN_BUY_USD = 300;
+const MIN_LIQ = 5000;
+const MAX_LIQ = 500000;
+const MIN_MCAP = 10000;
+const MAX_MCAP = 5000000;
+const MAX_TOKEN_AGE_HOURS = 48;
 
-// Known Base stablecoins/wrapped tokens to ignore
-const IGNORED_TOKENS = new Set([
-    "0x4200000000000000000000000000000000000006", // WETH
-    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC
-    "0x50c5725949a6f0c72e6c4a641f24049a917db0cb", // DAI
-    "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca", // USDbC
-]);
+// WETH and stables — these are the INPUT tokens (what people spend)
+const WETH = "0x4200000000000000000000000000000000000006";
+const USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+const DAI = "0x50c5725949a6f0c72e6c4a641f24049a917db0cb";
+const USDbC = "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca";
 
-const pairCache = new Map();
+const BASE_TOKENS = new Set([WETH, USDC, DAI, USDbC]);
+
+// ETH price cache (for WETH→USD conversion)
+let ethPrice = 3000;
+let lastEthUpdate = 0;
+
+async function getEthPrice() {
+    if (Date.now() - lastEthUpdate < 60000 && ethPrice > 0) return ethPrice;
+    try {
+        const res = await axios.get(
+            "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
+            { timeout: 4000 }
+        );
+        ethPrice = res.data.ethereum.usd;
+        lastEthUpdate = Date.now();
+        console.log(`💰 ETH: $${ethPrice}`);
+    } catch {
+        console.log("⚠️  Using cached ETH price");
+    }
+    return ethPrice;
+}
+
+const pairCache = new Map(); // pairAddr -> { token0, token1 }
 const alerted = new Set();
 const whaleBuyers = new Map();
-const WINDOW = 5 * 60 * 1000; // 5 min window for memes (faster)
+const WINDOW = 5 * 60 * 1000;
 
 let totalSwapsDetected = 0;
 let totalAlertsTriggered = 0;
 
+// ========================================
+// 📊 TOKEN STATS
+// ========================================
 async function getTokenStats(token) {
     try {
         const res = await axios.get(
@@ -67,14 +91,12 @@ async function getTokenStats(token) {
         const pairs = res.data.pairs;
         if (!pairs?.length) return null;
 
-        // Pick the Base pair with most liquidity
         const basePair = pairs
             .filter((p) => p.chainId === "base")
             .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
 
         if (!basePair) return null;
 
-        // Calculate token age
         const createdAt = basePair.pairCreatedAt;
         const ageHours = createdAt
             ? (Date.now() - createdAt) / (1000 * 60 * 60)
@@ -88,7 +110,8 @@ async function getTokenStats(token) {
             ageHours,
             priceChange5m: basePair.priceChange?.m5 || 0,
             priceChange1h: basePair.priceChange?.h1 || 0,
-            txns5m: (basePair.txns?.m5?.buys || 0) + (basePair.txns?.m5?.sells || 0),
+            buys5m: basePair.txns?.m5?.buys || 0,
+            sells5m: basePair.txns?.m5?.sells || 0,
             volume5m: basePair.volume?.m5 || 0,
             name: basePair.baseToken?.name,
             symbol: basePair.baseToken?.symbol,
@@ -98,6 +121,9 @@ async function getTokenStats(token) {
     }
 }
 
+// ========================================
+// 🍯 HONEYPOT CHECK
+// ========================================
 async function quickHoneypotCheck(tokenAddress) {
     try {
         const res = await axios.get(
@@ -110,19 +136,20 @@ async function quickHoneypotCheck(tokenAddress) {
             sellTax: res.data.simulationResult?.sellTax || 0,
         };
     } catch {
-        // If check fails, don't block — just flag as unknown
         return { isHoneypot: false, buyTax: null, sellTax: null };
     }
 }
 
+// ========================================
+// 🐋 PROCESS WHALE BUY
+// ========================================
 async function processWhaleBuy(tokenAddress, buyerAddress, buyUsd, stats) {
     try {
         if (alerted.has(tokenAddress)) return;
 
-        // Track buyers in window
         if (!whaleBuyers.has(tokenAddress)) {
             whaleBuyers.set(tokenAddress, {
-                buyers: new Map(), // address -> buyUsd
+                buyers: new Map(),
                 firstSeen: Date.now(),
                 totalVolume: 0,
             });
@@ -130,7 +157,6 @@ async function processWhaleBuy(tokenAddress, buyerAddress, buyUsd, stats) {
 
         const data = whaleBuyers.get(tokenAddress);
 
-        // Reset window if expired
         if (Date.now() - data.firstSeen > WINDOW) {
             data.buyers.clear();
             data.firstSeen = Date.now();
@@ -147,13 +173,11 @@ async function processWhaleBuy(tokenAddress, buyerAddress, buyUsd, stats) {
             `🐋 ${stats.symbol} | Buy: $${buyUsd.toFixed(0)} | Whales: ${whaleCount} | Vol: $${totalVolume.toFixed(0)} | MCap: $${stats.marketCap.toFixed(0)}`
         );
 
-        // Alert on first big buy OR after 2+ whales
         const isBigSingleBuy = buyUsd >= 2000 && whaleCount === 1;
         const isMultiWhale = whaleCount >= 2;
 
         if (!isBigSingleBuy && !isMultiWhale) return;
 
-        // Quick honeypot check (non-blocking on failure)
         const honeypot = await quickHoneypotCheck(tokenAddress);
 
         if (honeypot.isHoneypot) {
@@ -161,11 +185,8 @@ async function processWhaleBuy(tokenAddress, buyerAddress, buyUsd, stats) {
             return;
         }
 
-        // Block insane taxes
         if (honeypot.buyTax > 10 || honeypot.sellTax > 10) {
-            console.log(
-                `❌ High tax blocked: ${stats.symbol} Buy: ${honeypot.buyTax}% Sell: ${honeypot.sellTax}%`
-            );
+            console.log(`❌ High tax: ${stats.symbol} Buy:${honeypot.buyTax}% Sell:${honeypot.sellTax}%`);
             return;
         }
 
@@ -176,20 +197,21 @@ async function processWhaleBuy(tokenAddress, buyerAddress, buyUsd, stats) {
             ? `🐳 BIG SINGLE BUY ($${buyUsd.toFixed(0)})`
             : `🐋 ${whaleCount} WHALES IN 5 MIN`;
 
-        const taxLine =
-            honeypot.buyTax !== null
-                ? `💸 Tax: Buy ${honeypot.buyTax}% / Sell ${honeypot.sellTax}%`
-                : `💸 Tax: Unverified`;
+        const taxLine = honeypot.buyTax !== null
+            ? `💸 Tax: Buy ${honeypot.buyTax}% / Sell ${honeypot.sellTax}%`
+            : `💸 Tax: Unverified`;
 
-        const ageLine =
-            stats.ageHours !== null
-                ? `⏱️ Age: ${stats.ageHours < 1 ? `${Math.round(stats.ageHours * 60)}m` : `${stats.ageHours.toFixed(1)}h`}`
-                : `⏱️ Age: Unknown`;
+        const ageLine = stats.ageHours !== null
+            ? `⏱️ Age: ${stats.ageHours < 1 ? `${Math.round(stats.ageHours * 60)}m` : `${stats.ageHours.toFixed(1)}h`}`
+            : `⏱️ Age: Unknown`;
 
-        const momentumLine =
-            stats.priceChange5m > 0
-                ? `📈 +${stats.priceChange5m}% (5m) | +${stats.priceChange1h}% (1h)`
-                : `📉 ${stats.priceChange5m}% (5m) | ${stats.priceChange1h}% (1h)`;
+        const momentumLine = stats.priceChange5m >= 0
+            ? `📈 +${stats.priceChange5m}% (5m) | +${stats.priceChange1h}% (1h)`
+            : `📉 ${stats.priceChange5m}% (5m) | ${stats.priceChange1h}% (1h)`;
+
+        const buyPressure = stats.buys5m + stats.sells5m > 0
+            ? `🟢 ${stats.buys5m}B / 🔴 ${stats.sells5m}S (5m)\n`
+            : "";
 
         const alert =
             `🚨 BASE MEME ALERT 🚨\n\n` +
@@ -202,19 +224,23 @@ async function processWhaleBuy(tokenAddress, buyerAddress, buyUsd, stats) {
             `📊 Market Cap: $${stats.marketCap.toLocaleString()}\n` +
             `${ageLine}\n` +
             `${momentumLine}\n` +
+            `${buyPressure}` +
             `${taxLine}\n\n` +
             `🔗 Dex: https://dexscreener.com/base/${tokenAddress}\n` +
             `📊 Chart: https://www.dextools.io/app/base/pair-explorer/${stats.pairAddress}\n` +
-            `🦅 Maestro: https://t.me/MaestroSniperBot?start=${tokenAddress}`;
+            `🦎 BaseScan: https://basescan.org/token/${tokenAddress}`;
 
         queueAlert(alert);
-        console.log(`✅ MEME ALERT #${totalAlertsTriggered}: ${stats.symbol} | MCap: $${stats.marketCap.toLocaleString()}`);
+        console.log(`✅ BASE ALERT #${totalAlertsTriggered}: ${stats.symbol} | MCap: $${stats.marketCap.toLocaleString()}`);
 
     } catch (err) {
         console.log(`⚠️ processWhaleBuy error:`, err.message);
     }
 }
 
+// ========================================
+// 🎯 SWAP LISTENER
+// ========================================
 function startListening() {
     console.log("🐸 Listening for Base meme swaps...");
 
@@ -222,11 +248,10 @@ function startListening() {
         try {
             totalSwapsDetected++;
             if (totalSwapsDetected % 500 === 0) {
-                console.log(`📡 ${totalSwapsDetected} swaps scanned | ${totalAlertsTriggered} alerts fired`);
+                console.log(`📡 ${totalSwapsDetected} swaps | ${totalAlertsTriggered} alerts`);
             }
 
             const pairAddr = log.address.toLowerCase();
-
             let token0, token1;
 
             if (pairCache.has(pairAddr)) {
@@ -245,63 +270,85 @@ function startListening() {
 
             const iface = new ethers.Interface(PAIR_ABI);
             const decoded = iface.parseLog(log);
-            const { amount0Out, amount1Out, to } = decoded.args;
+            const { amount0In, amount1In, amount0Out, amount1Out, to } = decoded.args;
 
-            // Determine which token was bought
-            let boughtToken;
-            if (amount0Out > 0n && !IGNORED_TOKENS.has(token0)) {
-                boughtToken = token0;
-            } else if (amount1Out > 0n && !IGNORED_TOKENS.has(token1)) {
+            /**
+             * ✅ FIX: Correct buy USD calculation
+             *
+             * Uniswap V2 Swap event:
+             *   amount0In / amount1In  = tokens going INTO the pool (what buyer spent)
+             *   amount0Out / amount1Out = tokens coming OUT of the pool (what buyer received)
+             *
+             * To find what the buyer SPENT (in ETH/USDC):
+             *   - If token0 is WETH/stable → buyer spent amount0In of token0
+             *   - If token1 is WETH/stable → buyer spent amount1In of token1
+             *
+             * Then convert that ETH/USDC amount to USD.
+             */
+
+            let boughtToken = null;
+            let buyUsd = 0;
+
+            const eth = await getEthPrice();
+
+            if (BASE_TOKENS.has(token0) && amount1Out > 0n) {
+                // Buyer spent token0 (WETH/stable), received token1 (meme)
                 boughtToken = token1;
+                if (token0 === WETH) {
+                    buyUsd = Number(ethers.formatEther(amount0In)) * eth;
+                } else {
+                    // USDC/DAI are 6 decimals
+                    buyUsd = Number(ethers.formatUnits(amount0In, 6));
+                }
+            } else if (BASE_TOKENS.has(token1) && amount0Out > 0n) {
+                // Buyer spent token1 (WETH/stable), received token0 (meme)
+                boughtToken = token0;
+                if (token1 === WETH) {
+                    buyUsd = Number(ethers.formatEther(amount1In)) * eth;
+                } else {
+                    buyUsd = Number(ethers.formatUnits(amount1In, 6));
+                }
             } else {
-                return; // Buying a stable/WETH — not a meme
+                return; // Token-to-token swap, not a meme buy
             }
 
+            if (!boughtToken || buyUsd < MIN_BUY_USD) return;
             if (alerted.has(boughtToken)) return;
 
-            // Fetch stats
+            // Fetch stats and apply meme filters
             const stats = await getTokenStats(boughtToken);
             if (!stats) return;
 
-            // Meme coin filters
             if (stats.liquidity < MIN_LIQ || stats.liquidity > MAX_LIQ) return;
             if (stats.marketCap < MIN_MCAP || stats.marketCap > MAX_MCAP) return;
             if (stats.ageHours !== null && stats.ageHours > MAX_TOKEN_AGE_HOURS) return;
 
-            // Calculate buy size
-            const decimals = 18; // Default, good enough for USD calc via priceUsd
-            const amountOut = amount0Out > 0n ? amount0Out : amount1Out;
-            const amount = Number(ethers.formatUnits(amountOut, decimals));
-            const buyUsd = amount * Number(stats.priceUsd);
-
-            if (buyUsd < MIN_BUY_USD) return;
-
             await processWhaleBuy(boughtToken, to.toLowerCase(), buyUsd, stats);
 
-        } catch (err) {
-            // Silent — high volume, errors expected
+        } catch {
+            // Silent — high volume
         }
     });
 }
 
+// ========================================
+// 🎯 MAIN WATCHER
+// ========================================
 export function watchBase() {
-    console.log("🟦 Base Meme Coin Detector LIVE");
+    console.log("🟦 Base Meme Detector LIVE (Fixed)");
     console.log(`💰 Min Buy: $${MIN_BUY_USD} | Liq: $${MIN_LIQ}-$${MAX_LIQ} | MCap: $${MIN_MCAP}-$${MAX_MCAP}`);
+    console.log("🔧 Fix: buyUsd now reads ETH/USDC input side of swap");
 
+    getEthPrice();
     startListening();
 
-    // Cleanup
     setInterval(() => {
         const now = Date.now();
         for (const [token, data] of whaleBuyers.entries()) {
-            if (now - data.firstSeen > WINDOW * 3) {
-                whaleBuyers.delete(token);
-            }
+            if (now - data.firstSeen > WINDOW * 3) whaleBuyers.delete(token);
         }
-        if (alerted.size > 1000) {
-            alerted.clear();
-            console.log("🧹 Cleared alert cache");
-        }
-        console.log(`📊 Status: ${whaleBuyers.size} tracked tokens | ${alerted.size} alerted`);
+        if (alerted.size > 1000) { alerted.clear(); console.log("🧹 Cleared alert cache"); }
+        if (pairCache.size > 5000) pairCache.clear();
+        console.log(`📊 Status: ${whaleBuyers.size} tracked | ${alerted.size} alerted | ${totalSwapsDetected} swaps`);
     }, 60000);
 }
