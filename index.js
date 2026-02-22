@@ -1,5 +1,5 @@
 import { watchBase } from "./base/baseWatcher.js";
-import { watchSolana } from "./solana/solanaMomentumWatcher.js";
+import { watchSolanaMomentum } from "./solana/solanaMomentumWatcher.js";
 import { queueAlert } from "./utils/alertQueue.js";
 
 // Optional — only import if these files exist
@@ -39,7 +39,7 @@ try {
 }
 
 try {
-    watchSolana();
+    watchSolanaMomentum();
     console.log("✅ Solana detector initialized");
 } catch (err) {
     console.error("❌ Solana detector failed:", err.message);
