@@ -302,7 +302,7 @@ async function scanProgram(programId, label, lastSigKey) {
 }
 
 
-export function watchSolana() {
+export function watchSolanaMomentum() {
     console.log("🟣 Solana Meme Detector LIVE (Fixed)");
     console.log(`💰 Min Buy: $${MIN_BUY_USD} | MCap: $${MIN_MCAP.toLocaleString()}-$${MAX_MCAP.toLocaleString()}`);
     console.log("📡 Monitoring: Pump.fun | Raydium V4 | Raydium CPMM");
