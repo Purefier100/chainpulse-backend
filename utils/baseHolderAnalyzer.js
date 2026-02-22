@@ -1,12 +1,7 @@
 import { ethers } from "ethers";
 import axios from "axios";
 
-/**
- * ========================================
- * 👥 BASE HOLDER DISTRIBUTION ANALYZER
- * ========================================
- * Checks token holder concentration on Base chain
- */
+
 
 const holderCache = new Map();
 
@@ -16,10 +11,7 @@ const ERC20_ABI = [
     "function totalSupply() view returns (uint256)",
 ];
 
-/**
- * Analyze holder distribution for Base tokens
- * Uses Basescan API to get top holders
- */
+
 export async function analyzeBaseHolders(tokenAddress, provider) {
     try {
         // Check cache (5 min)
