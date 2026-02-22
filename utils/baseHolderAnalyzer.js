@@ -143,11 +143,7 @@ async function getTopHoldersFromDexScreener(tokenAddress) {
         const pair = response.data?.pairs?.[0];
         if (!pair) return null;
 
-        // DexScreener doesn't provide holder distribution
-        // For production, use Basescan API:
-        // https://api.basescan.org/api?module=token&action=tokenholderlist&contractaddress=${tokenAddress}&apikey=YOUR_KEY
 
-        // Return empty for now - this forces the fallback logic
         return null;
     } catch (err) {
         return null;
